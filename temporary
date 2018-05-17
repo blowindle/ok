@@ -1,0 +1,575 @@
+#include <hidef.h>     
+#include "derivative.h"
+#include "typedyf.h"
+#define ON 0
+#define OFF 1 
+#define BUS_CLOCK		   32000000	   //总线频率32M,系统频率64M
+#define OSC_CLOCK		   16000000	   //晶振频率
+#define Angle_ID  0x0135
+#define Angle_ID1  0x0139
+#define ID                  0x0001       //发送标识符
+#define data_len_TX         7            //发送标识符长度
+float front_angle,target_front_angle
+float steer_angle,last_steer_angle,v,angle_ratio
+int flag_1=0,flag_2=0，angle_data,front_angle_data,v_data //flag_1表示转向方向
+//内部锁相环模块初始化
+ void PLL_init(void) 
+{
+    DISABLE_INTERRUPTS;
+    CLKSEL &= 0x7f;//CLKSEL第七位置0，选择系统时钟源为OSCCLK
+                   //在PLL程序执行前内部总线频率=OSCCLK/2
+                   //允许寄存器SYNR、REFDV写入      
+    PLLCTL &= 0xBF;//关闭PLL电路      
+    CRGINT &= 0x7F;//禁止实时中断
+    #if(BUS_CLOCK == 40000000) 
+      SYNR = 0x44;
+    #elif(BUS_CLOCK == 32000000)
+      SYNR = 0x43;     
+    #elif(BUS_CLOCK == 24000000)
+      SYNR = 0x42;
+    #endif 
+    REFDV = 0x81;//系统频率64MHz 系统频率=2×OSCCLK×(SYNY（6位）+1)/(REFDV（4位）+1)
+    PLLCTL =PLLCTL|0x60//打开PLL，设置自动带宽控制
+    asm NOP;
+    asm NOP;
+    while(!(CRGFLG&0x08)); 
+    CLKSEL |= 0x80;//允许锁相环时钟源作为系统时钟源
+           
+}
+//看门狗初始化
+  void WATCHDOG_init(void)
+{
+ COPCTL = 0x07;//设置看门狗复位间隔分频值
+} 
+//喂狗初始化
+void feed_cop(void)
+{
+ ARMCOP=0x55;
+ ARMCOP=0xAA;
+}
+//延迟模块
+void delay() 
+{
+ int a=0;
+ for(a=0;a<60;a++) 
+   {
+    asm NOP;
+   }
+}
+//发送报文的结构体
+struct can_msg     
+{
+    unsigned int id;
+    Bool RTR;
+    unsigned char data[8];
+    unsigned char len;
+    unsigned char prty;
+};
+void MSCAN0Init(void);
+Bool MSCAN0SendMsg(struct can_msg msg); 
+Bool MSCAN0GetMsg(struct can_msg *msg);
+//CAN初始化
+void MSCAN0Init(void) 
+{
+  if(CAN0CTL0_INITRQ==0)      // 查询是否进入初始化状态   
+    CAN0CTL0_INITRQ =1;        // 进入初始化状态
+
+  while (CAN0CTL1_INITAK==0);  //等待进入初始化状态
+
+  CAN0BTR0_SJW = 0;            //设置同步
+  CAN0BTR0_BRP = 3;            //设置波特率预分频  
+  CAN0BTR1 = 0x9c;             //TSEG2=2Tq,TSEG1=13Tq Bit Rate=500kb/s
+// 关闭滤波器                                  
+  CAN0IDMR0 = 0xFF;
+  CAN0IDMR1 = 0xFF;
+  CAN0IDMR2 = 0xFF;
+  CAN0IDMR3 = 0xFF;
+  CAN0IDMR4 = 0xFF;
+  CAN0IDMR5 = 0xFF;
+  CAN0IDMR6 = 0xFF;
+  CAN0IDMR7 = 0xFF; 
+
+  CAN0CTL1 = 0xC7;             //使能MSCAN模块,设置为一般运行模式、使用总线时钟源 
+
+  CAN0CTL0 = 0x00;             //返回一般模式运行
+
+  while(CAN0CTL1_INITAK);      //等待回到一般运行模式
+
+  while(CAN0CTL0_SYNCH==0);    //等待总线时钟同步
+
+  CAN0RIER_RXFIE = 0;          //禁止接收中断
+}
+//CAN0发送      
+Bool MSCAN0SendMsg(struct can_msg msg)
+{
+  unsigned char send_buf, sp;
+  
+  // 检查数据长度
+  if(msg.len > 8)
+    return(FALSE);
+
+  // 检查总线时钟
+  if(CAN0CTL0_SYNCH==0)  //CAN0CTL0_SYNCH==1时与总线时钟同步
+    return(FALSE);
+
+  send_buf = 0;
+  do
+  {
+    // 寻找空闲的缓冲器
+    CAN0TBSEL=CAN0TFLG;
+    send_buf=CAN0TBSEL;
+  }
+  
+  while(!send_buf); 
+  
+  // 写入标识符
+  CAN0TXIDR0 = (unsigned char)(msg.id>>3);
+  CAN0TXIDR1 = (unsigned char)(msg.id<<5);
+  
+  if(msg.RTR)
+    // RTR = 阴性
+    CAN0TXIDR1 |= 0x10;
+    
+  // 写入数据
+  for(sp = 0; sp < msg.len; sp++)
+    *((&CAN0TXDSR0)+sp) = msg.data[sp];
+    
+  // 写入数据长度
+  CAN0TXDLR = msg.len; 
+  
+  // 写入优先级
+  CAN0TXTBPR = msg.prty;
+  
+  // 清 TXx 标志 (缓冲器准备发送)
+  CAN0TFLG = send_buf;
+                                                                                                        
+  return(TRUE);
+  
+}
+//CAN0接收
+Bool MSCAN0GetMsg(struct can_msg *msg)
+{
+  unsigned char sp2;
+
+  // 检测接收标志
+  if(!(CAN0RFLG_RXF))
+    return(FALSE);
+  
+  // 检测 CAN协议报文模式 （一般/扩展） 标识符
+  if(CAN0RXIDR1_IDE)
+    // IDE = Recessive (Extended Mode)
+    return(FALSE);
+
+  // 读标识符
+  msg->id = (unsigned int)(CAN0RXIDR0<<3) | 
+            (unsigned char)(CAN0RXIDR1>>5);
+  
+  if(CAN0RXIDR1&0x10)
+    msg->RTR = TRUE;
+  else
+    msg->RTR = FALSE;
+  
+  // 读取数据长度 
+  msg->len = CAN0RXDLR;
+  
+  // 读取数据
+  for(sp2 = 0; sp2 < msg->len; sp2++)
+    msg->data[sp2] = *((&CAN0RXDSR0)+sp2);
+
+  // 清 RXF 标志位 (缓冲器准备接收)
+  CAN0RFLG = 0x01;
+
+  return(TRUE);
+}
+
+//PWM模块初始化
+void PWM_init() 
+{
+  PWMCTL_CON01= 1;   //0和1级联成16位PWM
+  PWMCTL_CON23= 1;  
+  PWMCTL_CON45= 1;  
+  PWMCTL_CON67= 1;   
+  PWMPOL_PPOL1= 1;  //先输出高电平，当计数器值等于占空比计数值时，变为低电平。
+  PWMPOL_PPOL3= 1;  
+  PWMPOL_PPOL5= 1;   
+  PWMPOL_PPOL7= 1;   
+  PWMPRCLK = 0x00; //A时钟和B时钟均不分频，频率等于总线时钟 
+  PWMCLK =0x00;     //用A时钟或B时钟作为时钟源 
+  PWMCAE   = 0x00; //选择输出模式为左对齐输出模式  
+  PWMPER01  = 1600;   //周期为 0.5*10^(-4)Hz   PWM周期=通道时钟周期（通道时钟频率的倒数）*PWMPERx  ??
+  PWMPER23  = 1600;    
+  PWMPER45  = 1600;    
+  PWMPER67  = 1600;   
+  PWMDTY01  = 0;  //通道01占空比为(0/1600)*100%
+  PWMDTY23  = 0;   
+  PWMDTY45  = 0;  
+  PWMDTY67  = 0;   
+  PWME_PWME1 = 1;     //使能通道01
+  PWME_PWME3 = 1;   
+  PWME_PWME5 = 1;   
+  PWME_PWME7 = 1;    
+}
+//A/D模块初始化
+void AD_init() 
+{ 
+  ATD0CTL2=0x40;//对结果寄存器的访问将自动清除相应CCF标志位
+  ATD0CTL3=0x88;//打开转换电源开关，每次只转换1个通道,非FIFO模式、冻结模式下继续转换
+  ATD0CTL4=0x01;//采样时间为4个时钟周期，prs=1;ATDclock=BusClock/((PRS+1)*2)
+  ATD0CTL4&=0x7F;//10位转换精度
+  ATD0DIEN=0x00;// 禁止数字缓冲
+}
+/*说明:主要针对电动机两端电压(AD_capture(2)、AD_capture(1))，
+电源电压(AD_capture(3))，电机电流(AD_capture(4))，温度(AD_capture(5))
+以及继电器后端电压(AD_capture(6))进行防脉冲干扰滤波 */
+int AD_capture(uchar s) 
+{
+ uchar count,i;
+ int Max,Min,a[5],sum,Values;  
+ switch(s)
+ { 
+  case 1:
+ 
+     for(count=0;count<5;count++) 
+       {
+        ATD0CTL5 = 0x01;    //转换AD01
+        while(!ATD0STAT0_SCF);//判断一个转换序列完成
+        a[count]=ATD0DR0;
+       }
+     Max=a[0];
+     Min=a[0];
+     sum=a[0];
+     for(i=1;i<5;i++) 
+       {
+        sum=sum+a[i];
+        if(a[i]>Max) Max=a[i];
+        if(a[i]<Min) Min=a[i];
+       }
+     Values=(sum-Max-Min)/3;      
+     break; 
+
+  case 2:
+    
+    for(count=0;count<5;count++) 
+       {
+        ATD0CTL5 = 0x02;    //转换AD02
+        while(!ATD0STAT0_SCF);//判断一个转换序列完成
+        a[count]=ATD0DR0;
+       }
+     Max=a[0];
+     Min=a[0];
+     sum=a[0];
+     for(i=1;i<5;i++) 
+       {
+        sum=sum+a[i];
+        if(a[i]>Max) Max=a[i];
+        if(a[i]<Min) Min=a[i];
+       }
+     Values=(sum-Max-Min)/3;            
+     break;
+     
+  case 3:
+    
+    for(count=0;count<5;count++) 
+       {
+        ATD0CTL5 = 0x03;    //转换AD03
+        while(!ATD0STAT0_SCF);//判断一个转换序列完成
+        a[count]=ATD0DR0;
+       }
+     Max=a[0];
+     Min=a[0];
+     sum=a[0];
+     for(i=1;i<5;i++) 
+       {
+        sum=sum+a[i];
+        if(a[i]>Max) Max=a[i];
+        if(a[i]<Min) Min=a[i];
+       }
+     Values=(sum-Max-Min)/3;            
+     break;
+       
+                 
+   case 4:
+    
+    for(count=0;count<5;count++) 
+       {
+        ATD0CTL5 = 0x04;    //转换AD04
+        while(!ATD0STAT0_SCF);//判断一个转换序列完成
+        a[count]=ATD0DR0;
+       }
+     Max=a[0];
+     Min=a[0];
+     sum=a[0];
+     for(i=1;i<5;i++) 
+       {
+        sum=sum+a[i];
+        if(a[i]>Max) Max=a[i];
+        if(a[i]<Min) Min=a[i];
+       }
+     Values=(sum-Max-Min)/3;            
+     break;
+ 
+  case 5:
+    
+    for(count=0;count<5;count++) 
+       {
+        ATD0CTL5 = 0x05;    //转换AD05
+        while(!ATD0STAT0_SCF);//判断一个转换序列完成
+        a[count]=ATD0DR0;
+       }
+     Max=a[0];
+     Min=a[0];
+     sum=a[0];
+     for(i=1;i<5;i++) 
+       {
+        sum=sum+a[i];
+        if(a[i]>Max) Max=a[i];
+        if(a[i]<Min) Min=a[i];
+       }
+     Values=(sum-Max-Min)/3;            
+     break;
+     
+   case 6:
+    
+    for(count=0;count<5;count++) 
+       {
+        ATD0CTL5 = 0x06;    //转换AD06
+        while(!ATD0STAT0_SCF);//判断一个转换序列完成
+        a[count]=ATD0DR0;
+       }
+     Max=a[0];
+     Min=a[0];
+     sum=a[0];
+     for(i=1;i<5;i++) 
+       {
+        sum=sum+a[i];
+        if(a[i]>Max) Max=a[i];
+        if(a[i]<Min) Min=a[i];
+       }
+     Values=(sum-Max-Min)/3;            
+     break;
+ }
+ 
+ return Values;
+
+//基本定时器初始化
+void ECT_init(void)
+{
+  TSCR1_TFFCA = 1;     //快速清除定时器所有标志位
+  TSCR1_TEN = 1;    //1 允许定时器正常运行; 0禁止主定时器(包括计数器)，可用于降低功耗  
+  TIOS=0x07;        //0011 0111; 1表示相应通道做输出比较,0表示输入捕捉
+  TCTL3=0x0f;       //0000 1111; 7和6通道,禁止捕捉 5和4通道,在上升沿和下降沿都捕捉
+  TCTL4=0x40;       //0100 0000; 3通道,上升沿捕捉 2,1,0通道，禁止捕捉
+  TCTL1=0x00;       //7,6,5,4,通道设置为定时器与输出引脚断开
+  TCTL2=0x00;       //3,2,1,0,通道设置为定时器与输出引脚断开
+  TIE=0x10;         //0001 0100 允许通道4,2定时中断
+  TSCR2=0x06;	    //预分频系数为64,时钟频率为32MHz/64=0.5MHz;时钟周期为1/0.5MHz=2us
+  TFLG1=0xff;	    //清除各IC/OC(输入捕捉/输出比较) 中断标志位
+  TFLG2=0xff;     //清除自由定时器中断标志位
+}
+//周期定时器模块初始化
+void PIT_init()
+{
+ PITCE_PCE0=1;    //该位对应的通信PIT通道被启用
+ PITMTLD0=39;     // 0011 1001  设置8位微计数器初值为 39
+ PITLD0=7999;     //(39+1)*(7999+1)=320000个总线周期=10ms
+ PITMUX_PMUX0=0;  //第0通道使用微计数器0 
+ PITINTE=0x01;    //
+ PITCFLMT=0x80;   // 使能周期中断寄存器
+}
+//pid结构体定义
+typedef struct  PIDSING 
+{
+ float  Proportion;         //  比例常数 Proportional Const
+ float  Integral;           //  积分常数 Integral Const
+ float  Derivative;          //  微分常数 Derivative Const
+ float last_Derror        
+ float last_error;
+ float last_u_k;
+ int NegativePIDLimit;  
+ int PostivePIDLimit; 
+ float Proportion_2;
+ float Integral_2;
+ float Derivative_2;
+ float Proportion_3;
+ float Integral_3;
+ float Derivative_3;
+};
+int PIDCalc(float GiveValue,float MeasureValue,PIDSING pid) 
+{ 
+ float Derror,error;
+ float u_k,Du_k;
+ error = GiveValue-MeasureValue;
+ Derror = error - pid.last_error;
+ Du_k=pid.Proportion*Derror+pid.Integral*error+pid.Derivative*(Derror-last_Derror);
+ //Du_k=pid.Proportion_2*Derror+pid.Integral_2*error+pid.Derivative_2*(Derror-last_Derror);
+ //Du_k=pid.Proportion_3*Derror+pid.Integral_3*error+pid.Derivative_3*(Derror-last_Derror);//选择合适的pid值
+ u_k=pid.last_u_k+Du_k;
+ pid.last_error=error;
+ pid.last_Derror=Derror;
+ if(u_k>pid.PostivePIDLimit)
+    u_k=pid.PostivePIDLimit;
+ if(u_k<pid.NegativePIDLimit)
+    u_k=pid.NegativePIDLimit;
+  pid.last_u_k=u_k;
+ return u_k;
+}
+//PWM控制
+int PWM_high
+void PWM() 
+{
+ PWM_high=800+PIDCalc(traget_front_angle,front_angle,&pid)
+ if(flag_1==0)
+ {
+  PWMDTY01=PWM_high;
+ };else if(flag_==1)
+ {
+  PWMDTY23=PWM_high;
+ }
+  PWMDTY01=0;PWMDTY23=0;
+}
+//中断模块
+#pragma CODE_SEG __NEAR_SEG NON_BANKED
+void interrupt 38 steer_angle_sensor(void)
+{
+   if((steer_angle_send>0)||steer_angle_send==0)) 
+   {
+     flag_2=0;
+   }
+     flag_2=1://转角为负数
+  msg_send.data[0]=（abs(steer_angle)&0xFF00)>>8;  //高8位
+  msg_send.data[1]=(abs(steer_angle)&0x00FF);     //低8位
+  msg_send.id = Angle_ID1;
+  msg_send.len = data_len_TX;
+  msg_send.RTR = FALSE;
+  MSCAN0SendMsg(msg_send);
+  if(MSCAN0GetMsg(&msg_get))           //总线周期10ms
+      {
+        //接收新信息
+        if(msg_get.id == Angle_ID && (!msg_get.RTR)) 
+          {
+            //接收转向盘转角数据
+              angle_data = (msg_get.data[0]<<8|msg_get.data[1]);
+              if(flag_2==1)
+              {
+                steer_angle =-(angle_data-7800)/10;
+              }; 
+              else
+              {
+                steer_angle = (angle_data-7800)/10;
+              };
+                //转向盘转角
+            
+            if(last_steer_angle==steer_angle) 
+             {
+              flag_1=2 ;        //目标转角不变
+             } 
+            else if(steer_angle-last_steer_angle>0) 
+             {
+              flag_1=0;//顺时针
+             }
+              flag_1=1;//逆时针
+             last_steer_angle=steer_angle; 
+          }
+  
+  }
+
+void interrupt 12 front_angle_sensor(void) 
+{
+  msg_send.data[0]=（abs(front_angle)&0xFF00)>>8;  //高8位
+  msg_send.data[1]=(abs(front_angle)&0x00FF);     //低8位
+  msg_send.id = Angle_ID1;
+  msg_send.len = data_len_TX;
+  msg_send.RTR = FALSE;
+  MSCAN0SendMsg(msg_send);
+  if(MSCAN0GetMsg(&msg_get))           //总线周期10ms
+      {
+        //接收新信息
+        if(msg_get.id == Angle_ID && (!msg_get.RTR)) 
+          {
+            //接收位移传感器数据
+              front_angle_data = (msg_get.data[0]<<8|msg_get.data[1]);
+              if(flag_2==1)
+              {
+                front_angle =-front_angle_data*0.072;
+              }; 
+              else
+              {
+                front_angle = (front_angle_data*0.072;
+              };
+           }
+  }
+  float v_send
+  void interrupt 13 v_sensor(void) 
+  {
+  msg_send.data[0]=（v_send&0xFF00)>>8;  //高8位
+  msg_send.data[1]=(v_send&0x00FF);     //低8位
+  msg_send.id = Angle_ID1;
+  msg_send.len = data_len_TX;
+  msg_send.RTR = FALSE;
+  MSCAN0SendMsg(msg_send);
+  if(MSCAN0GetMsg(&msg_get))           //总线周期10ms
+      {
+        //接收新信息
+        if(msg_get.id == Angle_ID && (!msg_get.RTR)) 
+          {
+            //接收车速传感器数据
+              v_data = (msg_get.data[0]<<8|msg_get.data[1]);
+              v=v_data*36;
+              if(v<30||v==30)
+              {
+                angle_ratio=0.000012*v^3+10;
+              } 
+              else if(v>100)
+              {
+              angle_ratio=24; 
+              }
+              angle_ratio=-0.00002323*(v-100)^3+24
+           }
+           traget_angle=steer_angle/angle_ratio*16.5;
+  }
+ void interrupt 66 PIT_inter(void)   //周期性中断    10ms
+{
+ if(PITTF_PTF0==1)
+    PITTF_PTF0=1;
+ pidCalc();//pid
+}
+#pragma CODE_SEG DEFAULT
+//主程序
+void main() 
+{ 
+  DisableInterrupts;
+  PLL_init();
+  ECT_init();
+  PIT_init();
+  PWM_init();
+  AD_init();
+  WATCHDOG_init();
+  MSCAN0Init(); 
+  TC0=TCNT+500;//1ms
+  TC1=TCNT+1000;//2ms
+  TC2=TCNT+250;//500us
+  pid.Proportion=8;         //  比例常数 Proportional Const
+  pid.Integral=5;           //  积分常数 Integral Const
+  pid.Derivative=0;          //  微分常数 Derivative Const
+  pid.last_Derror=0;        
+  pid.last_error=0;
+  pid.last_u_k=0;
+  pid.NegativePIDLimit=0;  
+  pid.PostivePIDLimit=1400; 
+  pid.Proportion_2=10;
+  pid.Integral_2=8;
+  pid.Derivative_2=2;
+  pid.Proportion_3=30;
+  pid.Integral_3=10;
+  pid.Derivative_3=5;
+  DDRA=0xff;
+  PORTA=0x4f;
+  EnableInterrupts;
+
+ 
+  for(;;) 
+   {
+      feed_cop();
+      PWM();
+   }
+ }
